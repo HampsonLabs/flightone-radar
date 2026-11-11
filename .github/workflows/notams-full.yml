@@ -1,0 +1,40 @@
+name: NOTAMs full load
+
+on:
+  schedule:
+    - cron: "17 4 * * *"    # once a day (FAA limit: one full load in 24 hours)
+  workflow_dispatch: {}
+
+concurrency:
+  group: notams-full
+  cancel-in-progress: false
+
+permissions:
+  actions: write            # lets the last step keep this schedule switched on
+  contents: read
+
+jobs:
+  full-load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: notams
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python notam_full.py
+        env:
+          NMS_CLIENT_ID: ${{ secrets.NMS_CLIENT_ID }}
+          NMS_CLIENT_SECRET: ${{ secrets.NMS_CLIENT_SECRET }}
+          NMS_HOST: ${{ vars.NMS_HOST }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      - if: always()
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/notams-full.yml/enable" || true
+        env:
+          GH_TOKEN: ${{ github.token }}
