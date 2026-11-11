@@ -1,0 +1,77 @@
+
+name: Cloudflare R2 Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-r2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Install boto3
+        run: python3 -m pip install boto3
+
+      - name: Test Cloudflare R2 read access
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import boto3
+          from botocore.config import Config
+
+          print("Checking Cloudflare R2 connection...", flush=True)
+
+          required = [
+              "R2_ACCOUNT_ID",
+              "R2_ACCESS_KEY_ID",
+              "R2_SECRET_ACCESS_KEY",
+          ]
+          if any(not os.getenv(key) for key in required):
+              raise SystemExit("Missing Cloudflare R2 GitHub secret")
+
+          client = boto3.client(
+              "s3",
+              endpoint_url=(
+                  f"https://{os.environ['R2_ACCOUNT_ID']}"
+                  ".r2.cloudflarestorage.com"
+              ),
+              aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+              region_name="auto",
+              config=Config(
+                  connect_timeout=10,
+                  read_timeout=20,
+                  retries={"max_attempts": 1},
+              ),
+          )
+
+          try:
+              result = client.list_objects_v2(
+                  Bucket="flightone-charts",
+                  Prefix="notams/",
+                  MaxKeys=1,
+              )
+              print("Cloudflare R2 connection successful", flush=True)
+              print("NOTAM storage listing successful", flush=True)
+              print(
+                  "At least one matching object:",
+                  bool(result.get("Contents")),
+                  flush=True,
+              )
+          except Exception as error:
+              print(
+                  "Cloudflare R2 test failed:",
+                  type(error).__name__,
+                  str(error)[:300],
+                  flush=True,
+              )
+              raise SystemExit(1)
+          PY
