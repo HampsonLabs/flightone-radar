@@ -183,31 +183,45 @@ class NMS:
         return self.token
 
     def classification(self, name: str) -> bytes:
-        log(f"NMS: requesting {name} classification")
+        """Request an FAA initial-load archive for one classification."""
+        from urllib.parse import urljoin, urlparse
+
+        log(f"NMS: requesting initial load for {name}")
+        token = self.bearer()
         self._pace()
-        headers = {"Authorization": f"Bearer {self.bearer()}", "nmsResponseFormat": "GEOJSON"}
-        r = self.requests.get(f"{self.host}/nmsapi/v1/notams",
-                              params={"classification": name, "allowRedirect": "false"},
-                              headers=headers, timeout=(10, 45), allow_redirects=False)
-        if r.status_code not in (200, 307):
-            raise RuntimeError(f"{name}: HTTP {r.status_code} {r.text[:200]}")
-        path = None
-        try:
-            path = (r.json().get("data") or {}).get("url")
-        except ValueError:
-            pass
-        path = path or r.headers.get("Location")
+        headers = {"Authorization": f"Bearer {token}", "nmsResponseFormat": "GEOJSON"}
+        endpoint = f"{self.host}/nmsapi/v1/notams/il/{name}"
+        response = self.requests.get(
+            endpoint, params={"allowRedirect": "false"},
+            headers=headers, timeout=(10, 45), allow_redirects=False,
+        )
+        if response.status_code not in (200, 302, 303, 307, 308):
+            raise RuntimeError(f"{name}: initial-load request returned HTTP {response.status_code}: {response.text[:200]}")
+
+        path = response.headers.get("Location")
         if not path:
-            raise RuntimeError(f"{name}: no content path in the response")
-        if path.startswith("http"):
-            url = path
-        elif path.startswith("/nmsapi/"):
-            url = self.host + path
-        else:
-            url = f"{self.host}/nmsapi{path}"
-        log(f"NMS: downloading {name} file")
-        self._pace()
-        content = self.requests.get(url, headers={"Authorization": f"Bearer {self.bearer()}"}, timeout=(10, 90))
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError(f"{name}: response had no download link or valid JSON") from exc
+            if isinstance(payload, dict):
+                data = payload.get("data") or {}
+                if isinstance(data, dict):
+                    path = data.get("url") or data.get("downloadUrl")
+                path = path or payload.get("url")
+
+        if not isinstance(path, str) or not path.strip():
+            raise RuntimeError(f"{name}: initial-load response did not contain a download URL")
+        url = urljoin(self.host + "/", path.strip())
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise RuntimeError(f"{name}: refused non-HTTPS download URL")
+
+        log(f"NMS: downloading {name} initial-load archive")
+        # A temporary signed URL is self-authorising. Never forward the FAA bearer
+        # token to a different host (e.g. Google Cloud Storage).
+        download_headers = {"Authorization": f"Bearer {self.bearer()}"} if parsed.hostname == urlparse(self.host).hostname else {}
+        content = self.requests.get(url, headers=download_headers, timeout=(10, 90))
         content.raise_for_status()
         log(f"NMS: downloaded {name} ({len(content.content):,} bytes)")
         return content.content
