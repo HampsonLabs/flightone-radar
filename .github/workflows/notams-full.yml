@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 40
     defaults:
       run:
-        working-directory: notams
+        working-directory: FlightOne-NOTAMs/notams
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
