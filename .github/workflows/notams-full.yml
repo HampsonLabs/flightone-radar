@@ -10,7 +10,6 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: write            # lets the last step keep this schedule switched on
   contents: read
 
 jobs:
@@ -34,7 +33,4 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      - if: always()
-        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/notams-full.yml/enable" || true
-        env:
-          GH_TOKEN: ${{ github.token }}
+     
