@@ -1,0 +1,16 @@
+name = "flightone-notams"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# Changes from the FAA every 3 minutes (their production limit: one change pull per 3 minutes).
+[triggers]
+crons = ["*/3 * * * *"]
+
+# Pre-production now. For production change to: https://api-nms.aim.faa.gov
+[vars]
+NMS_HOST = "https://api-staging.cgifederal-aim.com"
+
+# Same R2 bucket as the chart, terrain and radar servers; NOTAMs live under notams/.
+[[r2_buckets]]
+binding = "CHARTS"
+bucket_name = "flightone-charts"
