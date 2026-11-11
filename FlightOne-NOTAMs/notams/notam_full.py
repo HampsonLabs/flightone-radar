@@ -22,6 +22,11 @@ import sys
 import time
 import zipfile
 from datetime import datetime, timezone
+from botocore.config import Config
+
+def log(message: str) -> None:
+    print(f"[{now_iso()}] {message}", flush=True)
+
 
 PREFIX = "notams/"
 CLASSIFICATIONS = ["DOMESTIC", "INTERNATIONAL", "FDC", "MILITARY", "LOCAL_MILITARY"]
@@ -167,9 +172,10 @@ class NMS:
     def bearer(self) -> str:
         if self.token and self.expires > time.time() + 60:
             return self.token
+        log("NMS: requesting access token")
         self._pace()
         r = self.requests.post(f"{self.host}/v1/auth/token", data={"grant_type": "client_credentials"},
-                               auth=self.auth, timeout=60)
+                               auth=self.auth, timeout=(10, 30))
         r.raise_for_status()
         body = r.json()
         self.token = body["access_token"]
@@ -177,11 +183,12 @@ class NMS:
         return self.token
 
     def classification(self, name: str) -> bytes:
+        log(f"NMS: requesting {name} classification")
         self._pace()
         headers = {"Authorization": f"Bearer {self.bearer()}", "nmsResponseFormat": "GEOJSON"}
         r = self.requests.get(f"{self.host}/nmsapi/v1/notams",
                               params={"classification": name, "allowRedirect": "false"},
-                              headers=headers, timeout=120, allow_redirects=False)
+                              headers=headers, timeout=(10, 45), allow_redirects=False)
         if r.status_code not in (200, 307):
             raise RuntimeError(f"{name}: HTTP {r.status_code} {r.text[:200]}")
         path = None
@@ -198,9 +205,11 @@ class NMS:
             url = self.host + path
         else:
             url = f"{self.host}/nmsapi{path}"
+        log(f"NMS: downloading {name} file")
         self._pace()
-        content = self.requests.get(url, headers={"Authorization": f"Bearer {self.bearer()}"}, timeout=600)
+        content = self.requests.get(url, headers={"Authorization": f"Bearer {self.bearer()}"}, timeout=(10, 90))
         content.raise_for_status()
+        log(f"NMS: downloaded {name} ({len(content.content):,} bytes)")
         return content.content
 
 
@@ -214,6 +223,7 @@ def r2():
         aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
         region_name="auto",
+        config=Config(connect_timeout=10, read_timeout=45, retries={"max_attempts": 2, "mode": "standard"}),
     )
 
 
@@ -246,46 +256,54 @@ def get_json(s3, bucket: str, name: str):
 def main() -> int:
     host = os.environ.get("NMS_HOST") or STAGING
     bucket = os.environ.get("R2_BUCKET", "flightone-charts")
+    log(f"Starting NOTAM full load; NMS host: {host}; R2 bucket: {bucket}")
+    log("R2: connecting and reading previous status")
     s3 = r2()
     previous = get_json(s3, bucket, "state-full.json") or {}
     started = now_iso()
     put_json(s3, bucket, "state-full.json", {**previous, "running": True, "startedAt": started, "host": host})
+    log("R2: status updated; starting FAA classification requests")
 
     try:
         nms = NMS(host, os.environ["NMS_CLIENT_ID"], os.environ["NMS_CLIENT_SECRET"])
         features, counts = [], {}
         for name in CLASSIFICATIONS:
+            log(f"NMS: starting {name}")
             try:
                 batch = features_from_bytes(nms.classification(name))
             except Exception as error:
                 if name == "LOCAL_MILITARY":       # the FAA says there are none; never fail the load over it
-                    print(f"{name}: skipped ({error})")
+                    log(f"{name}: skipped ({error})")
                     continue
                 raise
             counts[name] = len(batch)
             features.extend(batch)
-            print(f"{name}: {len(batch)} NOTAMs")
+            log(f"{name}: {len(batch)} NOTAMs")
 
         shards = build_shards(features, time.time())
         total = sum(len(v) for v in shards.values())
-        print(f"{total} active NOTAMs in {len(shards)} locations")
+        log(f"{total} active NOTAMs in {len(shards)} locations")
         if total == 0:
             raise RuntimeError("the full load came back empty; nothing was changed")
         if previous.get("count") and total < 0.5 * previous["count"]:
             raise RuntimeError(f"only {total} NOTAMs against {previous['count']} last time; nothing was changed")
 
+        log("R2: listing existing NOTAM files")
         etags = existing_etags(s3, bucket)
+        log(f"R2: found {len(etags)} existing location files")
         uploaded = 0
-        for key, notams in shards.items():
+        for index, (key, notams) in enumerate(shards.items(), 1):
             body = shard_bytes(key, notams)
             if etags.get(key) == hashlib.md5(body).hexdigest():
                 continue
             s3.put_object(Bucket=bucket, Key=f"{PREFIX}loc/{key}.json", Body=body, ContentType="application/json")
             uploaded += 1
+            if uploaded % 250 == 0:
+                log(f"R2: uploaded {uploaded} location files; checked {index}/{len(shards)}")
         stale = [k for k in etags if k not in shards]
         for i in range(0, len(stale), 1000):
             s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": f"{PREFIX}loc/{k}.json"} for k in stale[i:i + 1000]]})
-        print(f"uploaded {uploaded}, unchanged {len(shards) - uploaded}, removed {len(stale)}")
+        log(f"uploaded {uploaded}, unchanged {len(shards) - uploaded}, removed {len(stale)}")
 
         put_json(s3, bucket, "state-full.json", {
             "running": False, "startedAt": started, "fullLoadAt": started, "finishedAt": now_iso(), "host": host,
@@ -294,9 +312,10 @@ def main() -> int:
         })
         return 0
     except Exception as error:
+        log(f"Full load error: {type(error).__name__}: {error}")
         put_json(s3, bucket, "state-full.json", {**previous, "running": False, "host": host,
                                                   "lastError": str(error)[:300], "lastErrorAt": now_iso()})
-        print(f"Full load failed: {error}", file=sys.stderr)
+        print(f"Full load failed: {error}", file=sys.stderr, flush=True)
         return 1
 
 
