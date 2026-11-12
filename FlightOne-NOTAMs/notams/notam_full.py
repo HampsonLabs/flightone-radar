@@ -22,15 +22,14 @@ import sys
 import time
 import zipfile
 from datetime import datetime, timezone
-from botocore.config import Config
-
-def log(message: str) -> None:
-    print(f"[{now_iso()}] {message}", flush=True)
-
 
 PREFIX = "notams/"
 CLASSIFICATIONS = ["DOMESTIC", "INTERNATIONAL", "FDC", "MILITARY", "LOCAL_MILITARY"]
 STAGING = "https://api-staging.cgifederal-aim.com"
+
+
+def log(message: str) -> None:
+    print(f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} {message}", flush=True)
 
 
 def now_iso() -> str:
@@ -172,59 +171,65 @@ class NMS:
     def bearer(self) -> str:
         if self.token and self.expires > time.time() + 60:
             return self.token
-        log("NMS: requesting access token")
         self._pace()
+        log("signing in")
         r = self.requests.post(f"{self.host}/v1/auth/token", data={"grant_type": "client_credentials"},
-                               auth=self.auth, timeout=(10, 30))
-        r.raise_for_status()
+                               auth=self.auth, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"sign-in failed: HTTP {r.status_code} {r.text[:200]}")
         body = r.json()
+        log("signed in")
         self.token = body["access_token"]
         self.expires = time.time() + float(body.get("expires_in") or 1799)
         return self.token
 
     def classification(self, name: str) -> bytes:
-        """Request an FAA initial-load archive for one classification."""
-        from urllib.parse import urljoin, urlparse
-
-        log(f"NMS: requesting initial load for {name}")
-        token = self.bearer()
+        """Full set for one classification. The classification must be the only query parameter: with any other
+        parameter the API returns the data in the response body instead of a download link (nms-api.yaml)."""
         self._pace()
-        headers = {"Authorization": f"Bearer {token}", "nmsResponseFormat": "GEOJSON"}
-        endpoint = f"{self.host}/nmsapi/v1/notams/il/{name}"
-        response = self.requests.get(
-            endpoint, params={"allowRedirect": "false"},
-            headers=headers, timeout=(10, 45), allow_redirects=False,
-        )
-        if response.status_code not in (200, 302, 303, 307, 308):
-            raise RuntimeError(f"{name}: initial-load request returned HTTP {response.status_code}: {response.text[:200]}")
-
-        path = response.headers.get("Location")
+        headers = {"Authorization": f"Bearer {self.bearer()}", "nmsResponseFormat": "GEOJSON"}
+        log(f"{name}: requesting")
+        r = self.requests.get(f"{self.host}/nmsapi/v1/notams", params={"classification": name},
+                              headers=headers, timeout=(30, 120), allow_redirects=False)
+        log(f"{name}: HTTP {r.status_code}")
+        if r.status_code not in (200, 307):
+            raise RuntimeError(f"{name}: HTTP {r.status_code} {r.text[:300]}")
+        path = r.headers.get("Location")
         if not path:
             try:
-                payload = response.json()
-            except ValueError as exc:
-                raise RuntimeError(f"{name}: response had no download link or valid JSON") from exc
-            if isinstance(payload, dict):
-                data = payload.get("data") or {}
-                if isinstance(data, dict):
-                    path = data.get("url") or data.get("downloadUrl")
-                path = path or payload.get("url")
-
-        if not isinstance(path, str) or not path.strip():
-            raise RuntimeError(f"{name}: initial-load response did not contain a download URL")
-        url = urljoin(self.host + "/", path.strip())
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or not parsed.hostname:
-            raise RuntimeError(f"{name}: refused non-HTTPS download URL")
-
-        log(f"NMS: downloading {name} initial-load archive")
-        # A temporary signed URL is self-authorising. Never forward the FAA bearer
-        # token to a different host (e.g. Google Cloud Storage).
-        download_headers = {"Authorization": f"Bearer {self.bearer()}"} if parsed.hostname == urlparse(self.host).hostname else {}
-        content = self.requests.get(url, headers=download_headers, timeout=(10, 90))
-        content.raise_for_status()
-        log(f"NMS: downloaded {name} ({len(content.content):,} bytes)")
-        return content.content
+                body = r.json()
+            except ValueError:
+                raise RuntimeError(f"{name}: unexpected response {r.text[:300]}")
+            data = body.get("data") or {}
+            if isinstance(data.get("geojson"), list):          # returned directly in the body
+                return r.content
+            path = data.get("url")
+        if not path:
+            raise RuntimeError(f"{name}: no download link in the response: {r.text[:300]}")
+        if path.startswith("http"):
+            url = path
+        elif path.startswith("/nmsapi/"):
+            url = self.host + path
+        else:
+            url = f"{self.host}/nmsapi{path}"
+        self._pace()
+        log(f"{name}: downloading")
+        started = time.time()
+        chunks, size, next_report = [], 0, 10 << 20
+        with self.requests.get(url, headers={"Authorization": f"Bearer {self.bearer()}"},
+                               timeout=(30, 120), stream=True) as content:
+            if content.status_code != 200:
+                raise RuntimeError(f"{name}: download HTTP {content.status_code} {content.text[:300]}")
+            for chunk in content.iter_content(1 << 20):
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= next_report:
+                    log(f"{name}: {size >> 20} MB")
+                    next_report += 10 << 20
+                if time.time() - started > 8 * 60:
+                    raise RuntimeError(f"{name}: download still running after 8 minutes ({size >> 20} MB); stopped")
+        log(f"{name}: {size / 1e6:.1f} MB in {time.time() - started:.0f} s")
+        return b"".join(chunks)
 
 
 # MARK: - R2
@@ -237,7 +242,6 @@ def r2():
         aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
         region_name="auto",
-        config=Config(connect_timeout=10, read_timeout=45, retries={"max_attempts": 2, "mode": "standard"}),
     )
 
 
@@ -270,19 +274,15 @@ def get_json(s3, bucket: str, name: str):
 def main() -> int:
     host = os.environ.get("NMS_HOST") or STAGING
     bucket = os.environ.get("R2_BUCKET", "flightone-charts")
-    log(f"Starting NOTAM full load; NMS host: {host}; R2 bucket: {bucket}")
-    log("R2: connecting and reading previous status")
     s3 = r2()
     previous = get_json(s3, bucket, "state-full.json") or {}
     started = now_iso()
     put_json(s3, bucket, "state-full.json", {**previous, "running": True, "startedAt": started, "host": host})
-    log("R2: status updated; starting FAA classification requests")
 
     try:
         nms = NMS(host, os.environ["NMS_CLIENT_ID"], os.environ["NMS_CLIENT_SECRET"])
         features, counts = [], {}
         for name in CLASSIFICATIONS:
-            log(f"NMS: starting {name}")
             try:
                 batch = features_from_bytes(nms.classification(name))
             except Exception as error:
@@ -302,18 +302,14 @@ def main() -> int:
         if previous.get("count") and total < 0.5 * previous["count"]:
             raise RuntimeError(f"only {total} NOTAMs against {previous['count']} last time; nothing was changed")
 
-        log("R2: listing existing NOTAM files")
         etags = existing_etags(s3, bucket)
-        log(f"R2: found {len(etags)} existing location files")
         uploaded = 0
-        for index, (key, notams) in enumerate(shards.items(), 1):
+        for key, notams in shards.items():
             body = shard_bytes(key, notams)
             if etags.get(key) == hashlib.md5(body).hexdigest():
                 continue
             s3.put_object(Bucket=bucket, Key=f"{PREFIX}loc/{key}.json", Body=body, ContentType="application/json")
             uploaded += 1
-            if uploaded % 250 == 0:
-                log(f"R2: uploaded {uploaded} location files; checked {index}/{len(shards)}")
         stale = [k for k in etags if k not in shards]
         for i in range(0, len(stale), 1000):
             s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": f"{PREFIX}loc/{k}.json"} for k in stale[i:i + 1000]]})
@@ -326,10 +322,9 @@ def main() -> int:
         })
         return 0
     except Exception as error:
-        log(f"Full load error: {type(error).__name__}: {error}")
         put_json(s3, bucket, "state-full.json", {**previous, "running": False, "host": host,
                                                   "lastError": str(error)[:300], "lastErrorAt": now_iso()})
-        print(f"Full load failed: {error}", file=sys.stderr, flush=True)
+        print(f"Full load failed: {error}", file=sys.stderr)
         return 1
 
 
