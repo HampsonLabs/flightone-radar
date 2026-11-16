@@ -1,0 +1,36 @@
+name: Wind
+
+on:
+  schedule:
+    - cron: "23 * * * *"   # every hour; the job stops at once if no new model run is out
+  workflow_dispatch: {}
+
+concurrency:
+  group: wind
+  cancel-in-progress: false
+
+permissions:
+  actions: write            # lets the last step keep this schedule switched on
+  contents: read
+
+jobs:
+  wind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python wind_job.py
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      # GitHub switches off schedules in repositories with no activity for 60 days; this keeps it on.
+      - if: always()
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/wind.yml/enable" || true
+        env:
+          GH_TOKEN: ${{ github.token }}
