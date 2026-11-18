@@ -30,6 +30,8 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
+import time
+
 import numpy as np
 
 SOURCE = "https://met-office-radar-obs-data.s3.eu-west-2.amazonaws.com"
@@ -56,6 +58,20 @@ NO_COVERAGE = (128, 128, 128, 46)  # inside the composite grid but beyond radar 
 # ---------------------------------------------------------------------------------------------------------------
 # Source bucket
 
+def fetch(url, timeout):
+    """GET with retries: the Met Office bucket occasionally times out the TLS handshake."""
+    last = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:  # URLError, timeout, connection reset
+            last = e
+            print(f"fetch retry {attempt + 1}/4 after {e!r}: {url}", file=sys.stderr)
+            time.sleep(5 * (attempt + 1))
+    raise last
+
+
 def s3_list(prefix="", delimiter="/", start_after=None):
     """All (common prefixes, [(key, last_modified)]) under prefix, following continuation tokens."""
     prefixes, keys, token = [], [], None
@@ -65,8 +81,7 @@ def s3_list(prefix="", delimiter="/", start_after=None):
             query["continuation-token"] = token
         elif start_after:
             query["start-after"] = start_after
-        with urllib.request.urlopen(f"{SOURCE}/?{urllib.parse.urlencode(query)}", timeout=60) as r:
-            root = ET.fromstring(r.read())
+        root = ET.fromstring(fetch(f"{SOURCE}/?{urllib.parse.urlencode(query)}", timeout=60))
         ns = {"s": root.tag.split("}")[0].strip("{")} if root.tag.startswith("{") else {"s": ""}
         q = (lambda t: f"s:{t}") if ns["s"] else (lambda t: t)
         for p in root.findall(q("CommonPrefixes"), ns):
@@ -103,8 +118,7 @@ def key_sort(key):
 
 def download(key):
     url = f"{SOURCE}/{urllib.parse.quote(key)}"
-    with urllib.request.urlopen(url, timeout=120) as r:
-        return r.read()
+    return fetch(url, timeout=120)
 
 
 # ---------------------------------------------------------------------------------------------------------------
